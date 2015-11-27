@@ -1077,6 +1077,18 @@ static int __unset_free_ocmem(struct venus_hfi_device *device)
 	if (!device->res->ocmem_size)
 		return rc;
 
+	mutex_lock(&device->write_lock);
+	mutex_lock(&device->read_lock);
+	rc = IS_VENUS_IN_VALID_STATE(device);
+	mutex_unlock(&device->read_lock);
+	mutex_unlock(&device->write_lock);
+
+	if (!rc) {
+		dprintk(VIDC_WARN,
+				"Core is in bad state, Skipping unset OCMEM\n");
+		goto core_in_bad_state;
+	}
+
 	init_completion(&release_resources_done);
 	rc = __unset_ocmem(device);
 	if (rc) {
@@ -1093,6 +1105,7 @@ static int __unset_free_ocmem(struct venus_hfi_device *device)
 		goto release_resources_failed;
 	}
 
+core_in_bad_state:
 	rc = __free_ocmem(device);
 	if (rc) {
 		dprintk(VIDC_ERR, "Failed to free OCMEM during PC\n");
@@ -1501,7 +1514,6 @@ static int venus_hfi_iface_cmdq_write_nolock(struct venus_hfi_device *device,
 					void *pkt)
 {
 	u32 rx_req_is_set = 0;
-	struct vidc_hal_cmd_pkt_hdr *cmd_packet;
 	struct vidc_iface_q_info *q_info;
 	int result = -EPERM;
 
@@ -1527,12 +1539,6 @@ static int venus_hfi_iface_cmdq_write_nolock(struct venus_hfi_device *device,
 		dprintk(VIDC_ERR, "cannot write to shared CMD Q's\n");
 		result = -ENODATA;
 		goto err_q_null;
-	}
-
-	cmd_packet = (struct vidc_hal_cmd_pkt_hdr *)pkt;
-	if ((cmd_packet->packet_type != HFI_CMD_SYS_PC_PREP) &&
-		(cmd_packet->packet_type != HFI_CMD_SYS_RELEASE_RESOURCE)) {
-		device->pc_num_cmds++;
 	}
 
 	if (!venus_hfi_write_queue(q_info, (u8 *)pkt, &rx_req_is_set)) {
@@ -2872,25 +2878,28 @@ err_pc_prep:
 static void venus_hfi_pm_hndlr(struct work_struct *work)
 {
 	int rc = 0;
-	u32 ctrl_status = 0;
 	struct venus_hfi_device *device = list_first_entry(
 			&hal_ctxt.dev_head, struct venus_hfi_device, list);
-
-	if (!device) {
-		dprintk(VIDC_ERR, "%s: NULL device\n", __func__);
-		return;
-	}
-
 	mutex_lock(&device->clk_pwr_lock);
 	if (device->clk_state == ENABLED_PREPARED || !device->power_enabled) {
 		dprintk(VIDC_DBG,
 				"Clocks status: %d, Power status: %d, ignore power off\n",
 				device->clk_state, device->power_enabled);
-		mutex_unlock(&device->clk_pwr_lock);
+		goto clks_enabled;
+	}
+	mutex_unlock(&device->clk_pwr_lock);
+
+	mutex_lock(&device->write_lock);
+	mutex_lock(&device->read_lock);
+	rc = IS_VENUS_IN_VALID_STATE(device);
+	mutex_unlock(&device->read_lock);
+	mutex_unlock(&device->write_lock);
+
+	if (!rc) {
+		dprintk(VIDC_WARN,
+				"Core is in bad state, Skipping power collapse\n");
 		return;
 	}
-	device->pc_num_cmds = 0;
-	mutex_unlock(&device->clk_pwr_lock);
 
 	rc = __unset_free_ocmem(device);
 	if (rc) {
@@ -2910,51 +2919,17 @@ static void venus_hfi_pm_hndlr(struct work_struct *work)
 	}
 
 	mutex_lock(&device->clk_pwr_lock);
-	if (device->pc_num_cmds) {
-		dprintk(VIDC_DBG,
-			"ignore power off due to client sent commands = %d\n",
-			device->pc_num_cmds);
-		goto skip_power_off;
-	}
 	if (device->clk_state == ENABLED_PREPARED) {
 		dprintk(VIDC_ERR,
 				"Clocks are still enabled after PC_PREP_DONE, ignore power off");
-		goto skip_power_off;
+		goto clks_enabled;
 	}
 
 	rc = venus_hfi_power_off(device);
-	if (rc) {
+	if (rc)
 		dprintk(VIDC_ERR, "Failed venus power off");
-		goto err_power_off;
-	}
-
+clks_enabled:
 	mutex_unlock(&device->clk_pwr_lock);
-	return;
-
-err_power_off:
-skip_power_off:
-
-	/* Reset PC_READY bit as power_off is skipped, if set by Venus */
-	ctrl_status = venus_hfi_read_register(device, VIDC_CPU_CS_SCIACMDARG0);
-	if (ctrl_status & VIDC_CPU_CS_SCIACMDARG0_HFI_CTRL_PC_READY) {
-		ctrl_status &= ~(VIDC_CPU_CS_SCIACMDARG0_HFI_CTRL_PC_READY);
-		venus_hfi_write_register(device, VIDC_CPU_CS_SCIACMDARG0,
-				ctrl_status, 0);
-	}
-
-	/* Cancel pending delayed works if any */
-	cancel_delayed_work(&venus_hfi_pm_work);
-	dprintk(VIDC_WARN, "Power off skipped (%d, %d)\n",
-		device->clk_state, device->pc_num_cmds);
-
-	mutex_unlock(&device->clk_pwr_lock);
-
-	rc = __alloc_set_ocmem(device, true);
-	if (rc) {
-		dprintk(VIDC_WARN,
-			"Failed to re-allocate OCMEM. Performance will be impacted\n");
-	}
-	return;
 }
 
 static int venus_hfi_try_clk_gating(struct venus_hfi_device *device)
@@ -2996,6 +2971,9 @@ static void venus_hfi_process_msg_event_notify(
 		(struct hfi_msg_event_notify_packet *)msg_hdr;
 	if (event_pkt && event_pkt->event_id ==
 		HFI_EVENT_SYS_ERROR) {
+
+		VENUS_SET_STATE(device, VENUS_STATE_DEINIT);
+
 		vsfr = (struct hfi_sfr_struct *)
 				device->sfr.align_virtual_addr;
 		if (vsfr)

@@ -6,7 +6,7 @@
  *  GK 2/5/95  -  Changed to support mounting root fs via NFS
  *  Added initrd & change_root: Werner Almesberger & Hans Lermen, Feb '96
  *  Moan early if gcc is old, avoiding bogus kernels - Paul Gortmaker, May '96
- *  Simplified starting of init:  Michael A. Griffith <grif@acm.org> 
+ *  Simplified starting of init:  Michael A. Griffith <grif@acm.org>
  */
 
 #include <linux/types.h>
@@ -77,6 +77,10 @@
 
 #ifdef CONFIG_X86_LOCAL_APIC
 #include <asm/smp.h>
+#endif
+
+#ifdef CONFIG_LGE_PM
+#include <linux/qpnp/power-on.h>
 #endif
 
 static int kernel_init(void *);
@@ -385,6 +389,7 @@ static noinline void __init_refok rest_init(void)
 	/* Call into cpu_idle with preempt disabled */
 	cpu_idle();
 }
+
 
 /* Check for early params. */
 static int __init do_early_param(char *param, char *val)
@@ -888,7 +893,6 @@ static int __init kernel_init(void * unused)
 	 * we're essentially up and running. Get rid of the
 	 * initmem segments and start the user-mode stuff..
 	 */
-
 	init_post();
 	return 0;
 }
